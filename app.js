@@ -19,6 +19,8 @@ let previewStream;
 let peerConnections = new Map(); // Map of userId -> RTCPeerConnection
 let participants = new Map(); // Map of userId -> participant data
 let iceCandidateQueues = new Map(); // Queue ICE candidates until peer connection is ready
+let audioContext;
+let gainNode;
 let roomId;
 let userName;
 let userId;
@@ -83,14 +85,18 @@ function generateUserId() {
 async function initPreview() {
     try {
         previewStream = await navigator.mediaDevices.getUserMedia({ 
-            audio: true, 
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                sampleRate: 44100
+            }, 
             video: true 
         });
         previewVideo.srcObject = previewStream;
         
         // Ensure preview video is muted to prevent echo
         previewVideo.muted = true;
-        previewVideo.volume = 0;
         previewVideo.setAttribute('muted', 'true');
         
         isAudioEnabled = true;
@@ -157,11 +163,27 @@ async function joinMeeting(isCreator) {
     }
 
     try {
-        // Get user media with preview settings
+        // Get user media with aggressive echo cancellation settings
         localStream = await navigator.mediaDevices.getUserMedia({
-            audio: isAudioEnabled,
+            audio: {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                sampleRate: 48000,
+                channelCount: 1,  // Mono audio to reduce echo
+                // Additional constraints for better echo cancellation
+                googEchoCancellation: true,
+                googAutoGainControl: true,
+                googNoiseSuppression: true,
+                googHighpassFilter: true,
+                googEchoCancellation2: true,
+                googDAEchoCancellation: true
+            },
             video: isVideoEnabled
         });
+
+        // Apply additional audio processing to local stream
+        await processLocalAudioStream();
 
         // Hide pre-join screen and show meeting UI
         preJoinScreen.classList.add('hidden');
@@ -178,10 +200,12 @@ async function joinMeeting(isCreator) {
 
         // Add local video
         addLocalVideo();
-        updateControlButtons();
-
-        // Join Firebase room
+        updateControlButtons();        // Join Firebase room
         await joinFirebaseRoom(isCreator);
+        
+        // Start aggressive audio monitoring and feedback prevention
+        setInterval(monitorAudioLevels, 1000); // Every second
+        setInterval(preventAudioFeedback, 2000); // Every 2 seconds
         
         updateStatus('Connected to meeting');
         startTimer();
@@ -198,9 +222,24 @@ function addLocalVideo() {
     
     const video = localVideoContainer.querySelector('video');
     video.srcObject = localStream;
-    video.muted = true; // Always mute local video to prevent echo
-    video.volume = 0; // Extra safety to prevent audio feedback
-    video.setAttribute('muted', 'true'); // Ensure muted attribute is set
+    
+    // CRITICAL: Multiple layers of muting for local video
+    video.muted = true;
+    video.setAttribute('muted', 'true');
+    video.defaultMuted = true;
+    
+    // Additional protection against feedback
+    video.addEventListener('volumechange', (e) => {
+        if (!video.muted) {
+            video.muted = true;
+            console.warn('Local video was unmuted, forcing mute to prevent feedback');
+        }
+    });
+
+    // Prevent any audio context creation from local video
+    video.addEventListener('play', () => {
+        video.muted = true;
+    });
     
     // Store local participant data
     participants.set(userId, {
@@ -213,6 +252,9 @@ function addLocalVideo() {
     
     updateVideoGrid();
     updateParticipantCount();
+    
+    // Apply immediate feedback prevention
+    setTimeout(preventAudioFeedback, 100);
 }
 
 function createVideoContainer(participantId, participantName, isLocal = false) {
@@ -220,11 +262,11 @@ function createVideoContainer(participantId, participantName, isLocal = false) {
     container.className = 'participant-video video-container';
     container.id = `video-${participantId}`;
     
-    // Ensure local video is always muted to prevent echo
+    // For MediaStreams, we can't control volume on video elements
     const mutedAttribute = isLocal ? 'muted' : '';
     
     container.innerHTML = `
-        <video autoplay ${mutedAttribute} playsinline class="w-full h-full object-cover" ${isLocal ? 'volume="0"' : ''}></video>
+        <video autoplay ${mutedAttribute} playsinline class="w-full h-full object-cover"></video>
         <div class="absolute bottom-2 left-2 bg-black bg-opacity-70 text-white text-xs px-2 py-1 rounded">
             <i class="fas fa-microphone mr-1 audio-icon"></i>
             <span class="name">${participantName}${isLocal ? ' (You)' : ''}</span>
@@ -234,15 +276,80 @@ function createVideoContainer(participantId, participantName, isLocal = false) {
         </div>
     `;
     
-    // Additional safety for local video
+    const video = container.querySelector('video');
+    
+    // For local video, ensure it's always muted to prevent echo
     if (isLocal) {
-        const video = container.querySelector('video');
         video.muted = true;
-        video.volume = 0;
         video.setAttribute('muted', 'true');
     }
     
     return container;
+}
+
+// Function to manage audio context for advanced processing (if needed)
+function initializeAudioContext() {
+    try {
+        if (!audioContext) {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        console.log('Audio context initialized');
+    } catch (error) {
+        console.log('Audio context initialization failed:', error);
+    }
+}
+
+// Process local audio stream to prevent echo
+async function processLocalAudioStream() {
+    try {
+        if (!audioContext) {
+            initializeAudioContext();
+        }
+
+        const audioTracks = localStream.getAudioTracks();
+        if (audioTracks.length > 0) {
+            // Apply additional constraints to audio track
+            const audioTrack = audioTracks[0];
+            
+            // Get current constraints and apply additional echo cancellation
+            const constraints = audioTrack.getConstraints();
+            await audioTrack.applyConstraints({
+                ...constraints,
+                echoCancellation: { exact: true },
+                noiseSuppression: { exact: true },
+                autoGainControl: { exact: true }
+            });
+
+            console.log('Local audio stream processed for echo cancellation');
+        }
+    } catch (error) {
+        console.log('Audio processing failed:', error);
+    }
+}
+
+// Enhanced function to prevent audio feedback
+function preventAudioFeedback() {
+    // Ensure all local videos are muted
+    const localVideos = document.querySelectorAll(`[id*="video-${userId}"] video`);
+    localVideos.forEach(video => {
+        video.muted = true;
+        video.setAttribute('muted', 'true');
+    });
+
+    // Monitor and adjust remote video audio settings
+    const remoteVideos = document.querySelectorAll(`video:not([id*="video-${userId}"])`);
+    remoteVideos.forEach(video => {
+        if (video.srcObject) {
+            // Ensure remote videos are not muted (so we can hear them)
+            video.muted = false;
+            
+            // Add event listener to handle any audio issues
+            video.addEventListener('volumechange', (e) => {
+                // Prevent manual volume changes that might cause feedback
+                e.preventDefault();
+            });
+        }
+    });
 }
 
 async function joinFirebaseRoom(isCreator) {
@@ -341,12 +448,14 @@ async function handleNewParticipant(participantId, participantData) {
 
     // Create video container
     const videoContainer = createVideoContainer(participantId, participantData.name);
-    videoGrid.appendChild(videoContainer);
-
-    // Create peer connection with enhanced configuration
+    videoGrid.appendChild(videoContainer);    // Create peer connection with enhanced configuration for echo cancellation
     const peerConnection = new RTCPeerConnection({
         ...servers,
-        iceCandidatePoolSize: 10
+        iceCandidatePoolSize: 10,
+        // Additional configuration to prevent echo
+        sdpSemantics: 'unified-plan',
+        bundlePolicy: 'balanced',
+        rtcpMuxPolicy: 'require'
     });
     peerConnections.set(participantId, peerConnection);
 
@@ -366,6 +475,8 @@ async function handleNewParticipant(participantId, participantData) {
         if (peerConnection.connectionState === 'connected') {
             console.log(`✅ Successfully connected to ${participantId}`);
             updateStatus(`Connected to ${participantData.name}`);
+            // Apply feedback prevention when connection is established
+            setTimeout(preventAudioFeedback, 500);
         } else if (peerConnection.connectionState === 'failed') {
             console.log(`❌ Connection failed with ${participantId}`);
             updateStatus(`Connection failed with ${participantData.name}`);
@@ -380,15 +491,32 @@ async function handleNewParticipant(participantId, participantData) {
             console.log(`ICE connection failed with ${participantId}, restarting...`);
             peerConnection.restartIce();
         }
-    };
-
-    // Handle remote stream with improved error handling
+    };    // Handle remote stream with aggressive echo prevention
     peerConnection.ontrack = (event) => {
         console.log(`Received ${event.track.kind} track from ${participantId}`);
         try {
             const video = videoContainer.querySelector('video');
             if (video && event.streams && event.streams[0]) {
                 video.srcObject = event.streams[0];
+                
+                // Critical: Remote videos should NOT be muted
+                video.muted = false;
+                
+                // Apply echo prevention settings
+                video.addEventListener('loadedmetadata', () => {
+                    // Ensure we can hear remote audio but prevent feedback
+                    preventAudioFeedback();
+                });
+
+                // Delay before playing to ensure proper setup
+                setTimeout(() => {
+                    video.play().catch(e => {
+                        console.log('Video autoplay failed:', e);
+                        // Try to play with user interaction
+                        video.onclick = () => video.play();
+                    });
+                }, 200);
+                
                 console.log(`Video stream assigned to ${participantId}`);
             }
         } catch (error) {
@@ -409,15 +537,16 @@ async function handleNewParticipant(participantId, participantData) {
     }
 
     // Wait a moment for everything to be set up
-    await new Promise(resolve => setTimeout(resolve, 200));
-
-    // Only initiate offer if our userId is "greater" than theirs to avoid race conditions
+    await new Promise(resolve => setTimeout(resolve, 200));    // Only initiate offer if our userId is "greater" than theirs to avoid race conditions
     if (userId > participantId) {
         console.log(`🚀 Initiating offer to ${participantId} (${userId} > ${participantId})`);
         try {
             const offer = await peerConnection.createOffer({
                 offerToReceiveAudio: true,
-                offerToReceiveVideo: true
+                offerToReceiveVideo: true,
+                // Additional constraints for echo cancellation
+                voiceActivityDetection: true,
+                iceRestart: false
             });
             await peerConnection.setLocalDescription(offer);
             await sendOffer(participantId, offer);
@@ -474,9 +603,7 @@ async function handleOffer(fromId, offer) {
                 console.log(`ICE connection failed with ${fromId}, restarting...`);
                 peerConnection.restartIce();
             }
-        };
-
-        // Handle remote stream
+        };        // Handle remote stream
         peerConnection.ontrack = (event) => {
             console.log(`Received ${event.track.kind} track from ${fromId}`);
             const videoContainer = document.getElementById(`video-${fromId}`);
@@ -484,6 +611,15 @@ async function handleOffer(fromId, offer) {
                 const video = videoContainer.querySelector('video');
                 if (video) {
                     video.srcObject = event.streams[0];
+                    
+                    // For MediaStreams, we can't set volume on video elements
+                    video.muted = false; // Allow audio playback for remote participants
+                    
+                    // Small delay before playing to ensure proper setup
+                    setTimeout(() => {
+                        video.play().catch(e => console.log('Video autoplay failed:', e));
+                    }, 100);
+                    
                     console.log(`Video stream assigned to ${fromId}`);
                 }
             }
@@ -683,7 +819,10 @@ async function toggleVideo() {
     if (!localStream.getVideoTracks().length && isVideoEnabled) {
         // Add video track
         try {
-            const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+            const videoStream = await navigator.mediaDevices.getUserMedia({ 
+                video: true,
+                audio: false  // Don't request audio again to prevent conflicts
+            });
             const track = videoStream.getVideoTracks()[0];
             localStream.addTrack(track);
             
@@ -695,11 +834,13 @@ async function toggleVideo() {
                 await pc.setLocalDescription(offer);
                 await sendOffer(participantId, offer);
             });
-            
-            // Update local video
+              // Update local video and ensure it stays muted
             const localVideo = document.querySelector(`#video-${userId} video`);
             if (localVideo) {
                 localVideo.srcObject = localStream;
+                // Ensure local video stays muted
+                localVideo.muted = true;
+                localVideo.setAttribute('muted', 'true');
             }
             
         } catch (error) {
@@ -723,6 +864,51 @@ async function toggleVideo() {
     }
 }
 
+// Function to monitor and actively prevent audio feedback
+function monitorAudioLevels() {
+    // Initialize audio context if needed
+    if (!audioContext) {
+        initializeAudioContext();
+    }
+    
+    // Apply aggressive feedback prevention
+    preventAudioFeedback();
+    
+    // Monitor connection states and audio tracks
+    peerConnections.forEach((pc, participantId) => {
+        if (pc.connectionState === 'connected') {
+            console.log(`Audio monitoring for ${participantId}: ${pc.iceConnectionState}`);
+            
+            // Check for audio tracks and ensure proper configuration
+            pc.getReceivers().forEach(receiver => {
+                if (receiver.track && receiver.track.kind === 'audio') {
+                    // Monitor audio track for issues
+                    if (receiver.track.enabled && receiver.track.readyState === 'live') {
+                        console.log(`Audio track healthy for ${participantId}`);
+                    }
+                }
+            });
+        }
+    });
+
+    // Additional check for local stream audio settings
+    if (localStream) {
+        const audioTracks = localStream.getAudioTracks();
+        audioTracks.forEach(track => {
+            if (track.enabled) {
+                // Ensure echo cancellation is still active
+                const settings = track.getSettings();
+                if (!settings.echoCancellation) {
+                    console.warn('Echo cancellation disabled, attempting to re-enable');
+                    track.applyConstraints({ echoCancellation: true }).catch(e => 
+                        console.log('Could not re-enable echo cancellation:', e)
+                    );
+                }
+            }
+        });
+    }
+}
+
 async function toggleScreenShare() {
     if (!isScreenSharing) {
         try {
@@ -742,11 +928,13 @@ async function toggleScreenShare() {
                     await sender.replaceTrack(videoTrack);
                 }
             });
-            
-            // Update local video
+              // Update local video but keep it muted
             const localVideo = document.querySelector(`#video-${userId} video`);
             if (localVideo) {
                 localVideo.srcObject = screenStream;
+                // Ensure local video stays muted even during screen share
+                localVideo.muted = true;
+                localVideo.setAttribute('muted', 'true');
             }
             
             isScreenSharing = true;
@@ -779,11 +967,13 @@ async function stopScreenShare() {
                 await sender.replaceTrack(videoTrack);
             }
         });
-        
-        // Update local video
+          // Update local video and ensure it stays muted
         const localVideo = document.querySelector(`#video-${userId} video`);
         if (localVideo) {
             localVideo.srcObject = localStream;
+            // Ensure local video stays muted
+            localVideo.muted = true;
+            localVideo.setAttribute('muted', 'true');
         }
     }
     
